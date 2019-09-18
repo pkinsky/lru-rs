@@ -14,7 +14,7 @@
 
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNpubESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
@@ -150,14 +150,31 @@ impl<K, V> LruEntry<K, V> {
     }
 }
 
+
+/// Used to tie a store to the LRU cache (canonical example: petgraph graph w/ lru cache holding (hash -> idx map))
+pub trait Associated<K, V> {
+    /// witness removal of some value from the LRU cache
+    fn witness_removal(&mut self, k: &K, v: &V);
+}
+
+pub struct NoOpAssociated;
+
+impl<K, V> Associated<K, V> for NoOpAssociated {
+    fn witness_removal(&mut self, _k: &K, _v: &V) {}
+}
+
+
+
 /// An LRU Cache
-pub struct LruCache<K, V, S = DefaultHashBuilder> {
+pub struct LruCache<K, V, S = DefaultHashBuilder, A = NoOpAssociated> {
     map: HashMap<KeyRef<K>, Box<LruEntry<K, V>>, S>,
     cap: usize,
 
     // head and tail are sigil nodes to faciliate inserting entries
     head: *mut LruEntry<K, V>,
     tail: *mut LruEntry<K, V>,
+
+    pub associated: A,
 }
 
 impl<K: Hash + Eq, V> LruCache<K, V> {
@@ -170,7 +187,7 @@ impl<K: Hash + Eq, V> LruCache<K, V> {
     /// let mut cache: LruCache<isize, &str> = LruCache::new(10);
     /// ```
     pub fn new(cap: usize) -> LruCache<K, V> {
-        LruCache::construct(cap, HashMap::with_capacity(cap))
+        LruCache::construct(cap, HashMap::with_capacity(cap), NoOpAssociated)
     }
 
     /// Creates a new LRU Cache that never automatically evicts items.
@@ -182,11 +199,19 @@ impl<K: Hash + Eq, V> LruCache<K, V> {
     /// let mut cache: LruCache<isize, &str> = LruCache::unbounded();
     /// ```
     pub fn unbounded() -> LruCache<K, V> {
-        LruCache::construct(usize::MAX, HashMap::default())
+        LruCache::construct(usize::MAX, HashMap::default(), NoOpAssociated)
     }
 }
 
-impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
+
+impl<K: Hash + Eq, V, A: Associated<K,V>> LruCache<K, V, DefaultHashBuilder, A> {
+    pub fn with_associated(cap: usize, a: A) -> LruCache<K, V, DefaultHashBuilder, A> {
+        LruCache::construct(cap, HashMap::with_capacity(cap), a)
+    }
+}
+
+
+impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S, NoOpAssociated> {
     /// Creates a new LRU Cache that holds at most `cap` items and
     /// uses the providedash builder to hash keys.
     ///
@@ -203,11 +228,17 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
     /// let mut cache: LruCache<isize, &str> = LruCache::with_hasher(10, s);
     /// ```
     pub fn with_hasher(cap: usize, hash_builder: S) -> LruCache<K, V, S> {
-        LruCache::construct(cap, HashMap::with_capacity_and_hasher(cap, hash_builder))
+        LruCache::construct(cap, HashMap::with_capacity_and_hasher(cap, hash_builder), NoOpAssociated)
+    }
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher, A: Associated<K,V>> LruCache<K, V, S, A> {
+    pub fn with_hasher_and_associated(cap: usize, hash_builder: S, a: A) -> LruCache<K, V, S, A> {
+        LruCache::construct(cap, HashMap::with_capacity_and_hasher(cap, hash_builder), a)
     }
 
     /// Creates a new LRU Cache with the given capacity.
-    fn construct(cap: usize, map: HashMap<KeyRef<K>, Box<LruEntry<K, V>>, S>) -> LruCache<K, V, S> {
+    fn construct(cap: usize, map: HashMap<KeyRef<K>, Box<LruEntry<K, V>>, S>, a: A) -> LruCache<K, V, S, A> {
         // NB: The compiler warns that cache does not need to be marked as mutable if we
         // declare it as such since we only mutate it inside the unsafe block.
         let cache = LruCache {
@@ -215,6 +246,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
             cap,
             head: unsafe { Box::into_raw(Box::new(mem::uninitialized::<LruEntry<K, V>>())) },
             tail: unsafe { Box::into_raw(Box::new(mem::uninitialized::<LruEntry<K, V>>())) },
+            associated: a,
         };
 
         unsafe {
@@ -263,6 +295,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
                         k: unsafe { &(*(*self.tail).prev).key },
                     };
                     let mut old_node = self.map.remove(&old_key).unwrap();
+
+                    // witness removal, to allow for update of associated data structures
+                    self.associated.witness_removal(&old_node.key, &old_node.val);
 
                     old_node.key = k;
                     old_node.val = v;
@@ -470,6 +505,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
         match self.map.remove(&key) {
             None => None,
             Some(mut old_node) => {
+                // witness removal, to allow for update of associated data structures
+                self.associated.witness_removal(&old_node.key, &old_node.val);
+
                 let node_ptr: *mut LruEntry<K, V> = &mut *old_node;
                 self.detach(node_ptr);
                 Some(old_node.val)
@@ -685,6 +723,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
                 k: unsafe { &(*(*self.tail).prev).key },
             };
             let mut old_node = self.map.remove(&old_key).unwrap();
+
+            // witness removal, to allow for update of associated data structures
+            self.associated.witness_removal(&old_node.key, &old_node.val);
+
             let node_ptr: *mut LruEntry<K, V> = &mut *old_node;
             self.detach(node_ptr);
             Some(old_node)
@@ -710,7 +752,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> LruCache<K, V, S> {
     }
 }
 
-impl<K, V, S> Drop for LruCache<K, V, S> {
+impl<K, V, S, A> Drop for LruCache<K, V, S, A> {
     fn drop(&mut self) {
         // Prevent compiler from trying to drop the un-initialized fields key and val in head
         // and tail
@@ -910,6 +952,14 @@ mod tests {
     use core::fmt::Debug;
     use scoped_threadpool::Pool;
 
+    struct TestAssociated<K,V>(std::vec::Vec<(K,V)>);
+
+    impl<K: Clone, V: Clone> super::Associated<K, V> for TestAssociated<K, V> {
+        fn witness_removal(&mut self, k: &K, v: &V) {
+            self.0.push((k.clone(), v.clone()))
+        }
+    }
+
     fn assert_opt_eq<V: PartialEq + Debug>(opt: Option<&V>, v: V) {
         assert!(opt.is_some());
         assert_eq!(opt.unwrap(), &v);
@@ -954,7 +1004,7 @@ mod tests {
         use hashbrown::hash_map::DefaultHashBuilder;
 
         let s = DefaultHashBuilder::default();;
-        let mut cache = LruCache::with_hasher(16, s);
+        let mut cache = LruCache::with_hasher_and_associated(16, s, super::NoOpAssociated);
 
         for i in 0..13370 {
             cache.put(i, ());
@@ -1021,7 +1071,7 @@ mod tests {
 
     #[test]
     fn test_put_removes_oldest() {
-        let mut cache = LruCache::new(2);
+        let mut cache = LruCache::with_associated(2, TestAssociated(vec!()));
 
         assert_eq!(cache.put("apple", "red"), None);
         assert_eq!(cache.put("banana", "yellow"), None);
@@ -1039,6 +1089,9 @@ mod tests {
         assert!(cache.get(&"pear").is_none());
         assert_opt_eq(cache.get(&"apple"), "green");
         assert_opt_eq(cache.get(&"tomato"), "red");
+
+        // witness expected cache removals
+        assert_eq!(cache.associated.0, vec!(("apple", "red"), ("banana", "yellow"), ("pear", "green")));
     }
 
     #[test]
@@ -1060,7 +1113,7 @@ mod tests {
 
     #[test]
     fn test_peek_lru() {
-        let mut cache = LruCache::new(2);
+        let mut cache = LruCache::with_associated(2, TestAssociated(vec!()));
 
         assert!(cache.peek_lru().is_none());
 
@@ -1073,6 +1126,9 @@ mod tests {
 
         cache.clear();
         assert!(cache.peek_lru().is_none());
+
+        assert_eq!(cache.associated.0, vec!(("banana", "yellow"), ("apple", "red")));
+
     }
 
     #[test]
@@ -1090,7 +1146,7 @@ mod tests {
 
     #[test]
     fn test_pop() {
-        let mut cache = LruCache::new(2);
+        let mut cache = LruCache::with_associated(2, TestAssociated(vec!()));
 
         cache.put("apple", "red");
         cache.put("banana", "yellow");
@@ -1105,11 +1161,14 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.get(&"apple").is_none());
         assert_opt_eq(cache.get(&"banana"), "yellow");
+
+        assert_eq!(cache.associated.0, vec!(("apple", "red")));
     }
 
     #[test]
     fn test_pop_lru() {
-        let mut cache = LruCache::new(200);
+        let mut cache = LruCache::with_associated(200, TestAssociated(vec!()));
+        let mut expected_removals = vec!();
 
         for i in 0..75 {
             cache.put(i, "A");
@@ -1122,6 +1181,11 @@ mod tests {
         }
         assert_eq!(cache.len(), 200);
 
+        //elems removed because 3x75 > 200 (max cache size for this test)
+        for i in 0..25 {
+            expected_removals.push((i, "A"));
+        }
+
         for i in 0..75 {
             assert_opt_eq(cache.get(&(74 - i + 100)), "B");
         }
@@ -1129,22 +1193,31 @@ mod tests {
 
         for i in 26..75 {
             assert_eq!(cache.pop_lru(), Some((i, "A")));
+            expected_removals.push((i, "A"));
         }
         for i in 0..75 {
             assert_eq!(cache.pop_lru(), Some((i + 200, "C")));
+            expected_removals.push((i + 200, "C"));
         }
         for i in 0..75 {
             assert_eq!(cache.pop_lru(), Some((74 - i + 100, "B")));
+            expected_removals.push((74 - i + 100, "B"));
         }
         assert_eq!(cache.pop_lru(), Some((25, "A")));
+        expected_removals.push((25, "A"));
+
         for _ in 0..50 {
             assert_eq!(cache.pop_lru(), None);
         }
+
+
+        assert_eq!(cache.associated.0, expected_removals);
     }
+
 
     #[test]
     fn test_clear() {
-        let mut cache = LruCache::new(2);
+        let mut cache = LruCache::with_associated(2, TestAssociated(vec!()));
 
         cache.put("apple", "red");
         cache.put("banana", "yellow");
@@ -1155,6 +1228,8 @@ mod tests {
 
         cache.clear();
         assert_eq!(cache.len(), 0);
+
+        assert_eq!(cache.associated.0, vec!(("apple", "red"), ("banana", "yellow")));
     }
 
     #[test]
@@ -1176,7 +1251,7 @@ mod tests {
 
     #[test]
     fn test_resize_smaller() {
-        let mut cache = LruCache::new(4);
+        let mut cache = LruCache::with_associated(4, TestAssociated(vec!()));
 
         cache.put(1, "a");
         cache.put(2, "b");
@@ -1190,6 +1265,8 @@ mod tests {
         assert!(cache.get(&2).is_none());
         assert_eq!(cache.get(&3), Some(&"c"));
         assert_eq!(cache.get(&4), Some(&"d"));
+
+        assert_eq!(cache.associated.0, vec!((1, "a"), (2, "b")));
     }
 
     #[test]
